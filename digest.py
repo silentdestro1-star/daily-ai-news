@@ -8,8 +8,7 @@ import os
 # CONFIGURATION
 # ============================================================
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-# Updated model name to ensure compatibility with current Groq API
-GROQ_MODEL = "llama-3.1-8b-instant" 
+GROQ_MODEL = "llama-3.1-8b-instant"  # Valid model name for current Groq API
 
 RSS_FEEDS = {
     "OpenAI Blog": "https://openai.com/news/rss.xml",
@@ -20,6 +19,10 @@ RSS_FEEDS = {
 }
 
 GITHUB_TRENDING_URL = "https://raw.githubusercontent.com/isboyjc/github-trending-api/main/data/daily/all.json"
+
+# Keywords to filter out corporate PR and promote technical news
+PR_KEYWORDS = ["academy", "partnership", "sales", "united nations", "speech", "anniversary", "cyber", "legal", "case study"]
+TECH_KEYWORDS = ["model", "paper", "framework", "tool", "research", "benchmark", "release", "update", "open-source", "api"]
 
 # ============================================================
 # HELPER FUNCTIONS
@@ -43,7 +46,7 @@ def fetch_rss(feed_url):
                     "description": description[:300],
                     "source": feed_url.split("/")[2]
                 })
-        return articles[:5]
+        return articles
     except Exception as e:
         print(f"Error fetching {feed_url}: {e}")
         return []
@@ -56,14 +59,16 @@ def fetch_github_trending():
         ai_keywords = ["ai", "ml", "llm", "gpt", "neural", "machine-learning", "deep-learning", "langchain", "transformer", "diffusion"]
         ai_repos = []
         for repo in data.get("items", data.get("repos", []))[:50]:
-            name = repo.get("name", "") or repo.get("repo", "")
+            # Fix: Extract proper repo name (owner/repo) from URL or field
+            url = repo.get("url", repo.get("link", ""))
+            name = repo.get("name") or repo.get("repo") or url.split("github.com/")[-1]
             desc = repo.get("description", "") or ""
             combined = (name + " " + desc).lower()
             if any(kw in combined for kw in ai_keywords):
                 ai_repos.append({
                     "name": name,
                     "description": desc[:200],
-                    "url": repo.get("url", repo.get("link", "")),
+                    "url": url,
                     "stars": repo.get("stars", repo.get("starCount", 0))
                 })
         return ai_repos[:5]
@@ -72,9 +77,9 @@ def fetch_github_trending():
         return []
 
 def call_groq(prompt, system_prompt):
-    """Generic function to call Groq API"""
     if not GROQ_API_KEY:
-        return "(API Key missing. Please check GitHub Secrets.)"
+        return "⚠️ **Error:** GROQ_API_KEY is missing. Please add it to GitHub Secrets."
+    
     payload = {
         "model": GROQ_MODEL,
         "messages": [
@@ -82,7 +87,7 @@ def call_groq(prompt, system_prompt):
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.7,
-        "max_tokens": 300
+        "max_tokens": 400
     }
     try:
         req = urllib.request.Request(
@@ -96,7 +101,18 @@ def call_groq(prompt, system_prompt):
         return result["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print(f"Groq API error: {e}")
-        return "(Summarizer unavailable — raw text below)\n" + prompt[:300]
+        return f"⚠️ **API Error:** {str(e)}. Check your Groq API key."
+
+def load_seen_articles():
+    if os.path.exists("data/seen_articles.json"):
+        with open("data/seen_articles.json", "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+def save_seen_articles(seen_set):
+    os.makedirs("data", exist_ok=True)
+    with open("data/seen_articles.json", "w", encoding="utf-8") as f:
+        json.dump(list(seen_set), f, indent=2)
 
 # ============================================================
 # MAIN WORKFLOW
@@ -111,37 +127,50 @@ def main():
             a["source_name"] = source_name
         all_articles.extend(articles)
 
-    seen_titles = set()
-    unique_articles = []
-    for a in all_articles:
-        if a["title"].lower() not in seen_titles:
-            seen_titles.add(a["title"].lower())
-            unique_articles.append(a)
+    # 1. Deduplication
+    seen_urls = load_seen_articles()
+    new_articles = [a for a in all_articles if a["link"] not in seen_urls]
 
-    # 1. Summarize News
+    # 2. Relevance Scoring (Filter out PR, promote Tech)
+    for a in new_articles:
+        text = (a["title"] + " " + a["description"]).lower()
+        score = sum(2 for kw in TECH_KEYWORDS if kw in text)
+        score -= sum(3 for kw in PR_KEYWORDS if kw in text)
+        a["score"] = score
+
+    # Sort by score (highest first) and take top 6
+    new_articles.sort(key=lambda x: x["score"], reverse=True)
+    top_articles = new_articles[:6]
+
+    # Save seen articles
+    for a in top_articles:
+        seen_urls.add(a["link"])
+    save_seen_articles(seen_urls)
+
+    # 3. Generate Summaries
     print("Summarizing news...")
-    for a in unique_articles[:6]: # Limit to 6 for speed
+    for a in top_articles:
         raw_text = f"Title: {a['title']}\nDescription: {a['description']}"
-        sys_prompt = "Rewrite the following AI news in 2-3 simple sentences for a beginner. Avoid jargon. Be concise."
+        sys_prompt = "Summarize this for a B.Tech AI/ML student in 2-3 simple sentences. Focus on what changed, why it matters, and skip PR language."
         a["summary"] = call_groq(raw_text, sys_prompt)
 
-    # 2. Generate AI Tool of the Day
+    # 4. Generate AI Tool of the Day
     print("Finding AI Tool of the Day...")
-    news_context = " | ".join([a["title"] for a in unique_articles[:6]])
-    tool_prompt = f"Based on today's AI news: {news_context}. Suggest ONE specific AI tool. Format: **Tool Name:** [Name]. **What it does:** [1 sentence]. **Link (if applicable):** [URL]."
-    ai_tool = call_groq(tool_prompt, "You are an AI tools expert. Suggest exactly one tool in the requested format.")
+    context = " | ".join([a["title"] for a in top_articles])
+    tool_prompt = f"Based on today's AI news: {context}. Pick ONE specific AI tool mentioned. Format exactly: **Tool Name:** [Name]. **What it does:** [1 sentence]. **How a B.Tech student can use it:** [1 sentence]. **Link:** [URL]."
+    ai_tool = call_groq(tool_prompt, "You are an AI tools expert. Give exactly one tool in the requested format.")
 
-    # 3. Generate B.Tech Student Task
+    # 5. Generate B.Tech Student Task
     print("Generating B.Tech Task...")
-    task_prompt = f"Based on today's AI news: {news_context}. Create ONE practical 30-60 minute task for a 2nd-year B.Tech student to improve their AI skills. Must be free and beginner-friendly. Format: **Task:** [Description]. **Why this helps:** [Reason]. **Steps:** [1-2 steps]."
+    task_prompt = f"Based on today's AI news: {context}. Create ONE practical 30-60 minute task for a 2nd-year B.Tech student. Must be free and beginner-friendly. Format exactly: **Task:** [Description]. **Why this helps:** [Reason]. **Steps:** [1-2 steps]."
     ai_task = call_groq(task_prompt, "You are an AI mentor for a 2nd-year B.Tech student. Give practical, free, hands-on tasks.")
 
-    # 4. Fetch GitHub Trending
+    # 6. Fetch GitHub Trending
     print("Fetching GitHub trending...")
     github_repos = fetch_github_trending()
 
     # ============================================================
-    # BUILD THE DIGEST (NEW FORMAT)
+    # BUILD THE DIGEST
     # ============================================================
     today = datetime.utcnow().strftime("%Y-%m-%d")
     lines = []
@@ -151,11 +180,14 @@ def main():
     # --- SECTION 1: AI NEWS ---
     lines.append("---")
     lines.append("## 📰 AI News (Simple Summary)\n")
-    for a in unique_articles[:6]:
-        lines.append(f"### {a['title']}")
-        lines.append(f"*Source: {a['source_name']}*\n")
-        lines.append(f"{a.get('summary', 'No summary available.')}\n")
-        lines.append(f"[Read original]({a['link']})\n")
+    if top_articles:
+        for a in top_articles:
+            lines.append(f"### {a['title']}")
+            lines.append(f"*Source: {a['source_name']}*\n")
+            lines.append(f"{a.get('summary', 'No summary available.')}\n")
+            lines.append(f"[Read original]({a['link']})\n")
+    else:
+        lines.append("No new AI news found today. Check back tomorrow!\n")
 
     # --- SECTION 2: AI TOOL OF THE DAY ---
     lines.append("---")
